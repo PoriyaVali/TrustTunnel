@@ -1,4 +1,5 @@
 pub mod registry_based;
+pub mod reloadable;
 
 use crate::log_utils;
 use std::borrow::Cow;
