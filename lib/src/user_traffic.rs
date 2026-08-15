@@ -205,7 +205,6 @@ mod tests {
             },
         )]);
         assert_eq!(rendered, r#"{"alice":{"uplink":10,"downlink":20}}"#);
-    }
 
     #[test]
     fn renders_nothing_as_an_empty_object() {
@@ -231,7 +230,7 @@ mod tests {
     #[test]
     fn control_characters_are_escaped() {
         let rendered = render_json(&[(user("a\nb\u{1}"), Usage::default())]);
-        assert!(rendered.contains(r"a\nb"), "got {rendered}");
+        assert_eq!(rendered, r#"{"a\nb\u0001":{"uplink":0,"downlink":0}}"#);
     }
 
     #[test]
