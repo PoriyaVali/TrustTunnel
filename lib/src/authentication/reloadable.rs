@@ -3,9 +3,15 @@ use crate::authentication::Authenticator;
 use crate::{authentication, log_utils};
 use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
 use base64::Engine;
-use std::borrow::Cow;
-use std::collections::HashSet;
-use std::sync::RwLock;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+/// Credentials as they arrive on the wire, mapped to the username behind them.
+///
+/// The username is only ever used to attribute traffic, so it is kept as an
+/// `Arc<str>`: a metric label can hold a cheap clone that stays valid even if
+/// the user is removed by a reload halfway through the connection.
+type Clients = HashMap<Box<str>, Arc<str>>;
 
 /// An [`Authenticator`] whose client list can be replaced while the endpoint is
 /// running.
@@ -24,7 +30,7 @@ use std::sync::RwLock;
 /// [`authenticate`]: Authenticator::authenticate
 /// [`reload`]: ReloadableAuthenticator::reload
 pub struct ReloadableAuthenticator {
-    clients: RwLock<HashSet<Cow<'static, str>>>,
+    clients: RwLock<Clients>,
 }
 
 impl ReloadableAuthenticator {
@@ -54,26 +60,49 @@ impl ReloadableAuthenticator {
         self.len() == 0
     }
 
+    /// The username the given credentials belong to, if they are known.
+    ///
+    /// Traffic has to be attributed to a user before it can be billed, and the
+    /// credentials are the only thing a connection carries: nothing downstream
+    /// of authentication knows which account it is serving. Returning the name
+    /// here keeps that lookup in the one place that already holds the mapping.
+    pub fn username_for(&self, source: &authentication::Source<'_>) -> Option<Arc<str>> {
+        self.read().get(Self::credentials(source)).cloned()
+    }
+
     /// The credential encoding is shared with `RegistryBasedAuthenticator`, and
     /// has to stay that way: it is what arrives in a `Proxy-Authorization`
     /// header.
-    fn encode(clients: &[Client]) -> HashSet<Cow<'static, str>> {
+    fn encode(clients: &[Client]) -> Clients {
         clients
             .iter()
-            .map(|x| BASE64_ENGINE.encode(format!("{}:{}", x.username, x.password)))
-            .map(Cow::Owned)
+            .map(|x| {
+                (
+                    BASE64_ENGINE
+                        .encode(format!("{}:{}", x.username, x.password))
+                        .into_boxed_str(),
+                    Arc::from(x.username.as_str()),
+                )
+            })
             .collect()
+    }
+
+    fn credentials<'a>(source: &'a authentication::Source<'_>) -> &'a str {
+        match source {
+            authentication::Source::ProxyBasic(str) => str,
+            authentication::Source::Sni(str) => str,
+        }
     }
 
     // A panic while the lock is held would poison it, and an authenticator that
     // panics on every subsequent request is a worse outcome than one that keeps
     // serving the set it already has. Neither critical section can panic, so
     // recovering the guard is the safe reading of a case that should not occur.
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashSet<Cow<'static, str>>> {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Clients> {
         self.clients.read().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashSet<Cow<'static, str>>> {
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Clients> {
         self.clients.write().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -84,11 +113,7 @@ impl Authenticator for ReloadableAuthenticator {
         source: &authentication::Source<'_>,
         _log_id: &log_utils::IdChain<u64>,
     ) -> authentication::Status {
-        let creds = match &source {
-            authentication::Source::ProxyBasic(str) => str,
-            authentication::Source::Sni(str) => str,
-        };
-        if self.read().contains(creds.as_ref()) {
+        if self.read().contains_key(Self::credentials(source)) {
             authentication::Status::Pass
         } else {
             authentication::Status::Reject
@@ -100,6 +125,7 @@ impl Authenticator for ReloadableAuthenticator {
 mod tests {
     use super::*;
     use authentication::{Source, Status};
+    use std::borrow::Cow;
 
     fn client(username: &str, password: &str) -> Client {
         Client {
@@ -177,6 +203,48 @@ mod tests {
         assert_eq!(auth.reload(&[]), 0);
         assert!(auth.is_empty());
         assert!(check(&auth, &creds("alice", "pw1")) == Status::Reject);
+    }
+
+    #[test]
+    fn credentials_resolve_to_a_username() {
+        // Traffic can only be billed once it has a name attached, and the
+        // credentials are all a connection carries.
+        let auth = ReloadableAuthenticator::new(&[client("alice", "pw1"), client("bob", "pw2")]);
+
+        assert_eq!(
+            auth.username_for(&creds("alice", "pw1")).as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            auth.username_for(&creds("bob", "pw2")).as_deref(),
+            Some("bob")
+        );
+        assert!(auth.username_for(&creds("eve", "pw")).is_none());
+    }
+
+    #[test]
+    fn a_username_survives_the_user_being_removed() {
+        // A connection is attributed for as long as it lives, so the name a
+        // caller is holding must not dangle when a reload drops the user.
+        let auth = ReloadableAuthenticator::new(&[client("alice", "pw1")]);
+        let held = auth.username_for(&creds("alice", "pw1")).expect("known");
+
+        auth.reload(&[]);
+
+        assert_eq!(&*held, "alice");
+        assert!(auth.username_for(&creds("alice", "pw1")).is_none());
+    }
+
+    #[test]
+    fn a_password_change_keeps_the_same_username() {
+        let auth = ReloadableAuthenticator::new(&[client("alice", "old")]);
+        auth.reload(&[client("alice", "new")]);
+
+        assert_eq!(
+            auth.username_for(&creds("alice", "new")).as_deref(),
+            Some("alice")
+        );
+        assert!(auth.username_for(&creds("alice", "old")).is_none());
     }
 
     #[test]
