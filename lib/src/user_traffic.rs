@@ -205,6 +205,7 @@ mod tests {
             },
         )]);
         assert_eq!(rendered, r#"{"alice":{"uplink":10,"downlink":20}}"#);
+    }
 
     #[test]
     fn renders_nothing_as_an_empty_object() {
