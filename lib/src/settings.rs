@@ -1561,40 +1561,50 @@ where
         )
     })?;
 
-    let clients: Document = content.parse().map_err(|e| {
+    parse_clients_toml(&content).map_err(|e| {
         serde::de::Error::invalid_value(
-            serde::de::Unexpected::Other(&format!(
-                "Couldn't parse file: path={} error={}",
-                path, e
-            )),
-            &"A TOML-formatted file",
+            serde::de::Unexpected::Other(&format!("path={} error={}", path, e)),
+            &"A TOML-formatted list of clients",
         )
-    })?;
+    })
+}
 
-    let res: Vec<Client> = clients
+/// Parse the contents of a credentials file into clients.
+///
+/// Split out of [`deserialize_clients`] so that reloading the file at runtime
+/// and reading it at startup cannot drift apart: a client list that parsed one
+/// way on boot and another way on reload would change who can authenticate,
+/// which is not something a caller could notice.
+pub fn parse_clients_toml(content: &str) -> Result<Vec<Client>, String> {
+    let clients: Document = content
+        .parse()
+        .map_err(|e| format!("Couldn't parse file: {e}"))?;
+
+    clients
         .get("client")
         .and_then(Item::as_array_of_tables)
-        .ok_or(serde::de::Error::invalid_value(
-            serde::de::Unexpected::Other("Not an array of clients"),
-            &"An array of clients",
-        ))?
+        .ok_or_else(|| "Not an array of clients".to_string())?
         .iter()
         .enumerate()
         .map(|(idx, x)| {
-            let username = demangle_toml_string(x["username"].to_string());
-            let password = demangle_toml_string(x["password"].to_string());
+            // Indexing would panic on a missing key. That only cost a failed
+            // startup before, but this parser now also runs on reload, where a
+            // half-written file must produce an error rather than take the
+            // endpoint down. A missing key reads as empty and is rejected just
+            // below, which is the same outcome by a survivable route.
+            let field = |name: &str| {
+                x.get(name)
+                    .map(|v| demangle_toml_string(v.to_string()))
+                    .unwrap_or_default()
+            };
+            let username = field("username");
+            let password = field("password");
 
             if username.is_empty() {
-                return Err(serde::de::Error::custom(format!(
-                    "Client #{}: username cannot be empty",
-                    idx + 1
-                )));
+                return Err(format!("Client #{}: username cannot be empty", idx + 1));
             }
             if password.is_empty() {
-                return Err(serde::de::Error::custom(format!(
-                    "Client #{}: password cannot be empty",
-                    idx + 1
-                )));
+                return Err(format!("Client #{}: password cannot be empty", idx + 1));
             }
 
             let max_http2_conns = x
@@ -1613,9 +1623,7 @@ where
                 max_http3_conns,
             })
         })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(res)
+        .collect()
 }
 
 fn deserialize_rules<'de, D>(deserializer: D) -> Result<Option<rules::RulesEngine>, D::Error>

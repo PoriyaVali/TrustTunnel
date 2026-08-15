@@ -193,6 +193,51 @@ mod tests {
         assert!(check(&auth, &Source::Sni(Cow::Owned(encoded))) == Status::Pass);
     }
 
+    /// The reload path reads a file that some other process is writing, so the
+    /// parser has to fail rather than panic on anything malformed. These go
+    /// through `parse_clients_toml`, which is the same parser startup uses.
+    mod credentials_file {
+        use crate::settings::parse_clients_toml;
+
+        #[test]
+        fn parses_a_normal_file() {
+            let clients = parse_clients_toml(
+                r#"
+                [[client]]
+                username = "alice"
+                password = "pw1"
+
+                [[client]]
+                username = "bob"
+                password = "pw2"
+                max_http2_conns = 4
+                "#,
+            )
+            .expect("should parse");
+
+            assert_eq!(clients.len(), 2);
+            assert_eq!(clients[0].username, "alice");
+            assert_eq!(clients[1].max_http2_conns, Some(4));
+        }
+
+        #[test]
+        fn a_truncated_file_is_an_error_not_a_panic() {
+            // What a reload would see mid-write.
+            for content in [
+                "[[client]]\nusername = \"alice\"",       // no password
+                "[[client]]\npassword = \"pw1\"",         // no username
+                "[[client]]\nusername = \"\"\npassword = \"pw\"", // empty
+                "[[client]",                              // cut off
+                "",                                       // empty file
+            ] {
+                assert!(
+                    parse_clients_toml(content).is_err(),
+                    "should have been rejected: {content:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn readers_and_a_reloader_can_run_together() {
         use std::sync::Arc;
