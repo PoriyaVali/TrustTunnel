@@ -561,15 +561,27 @@ fn main() {
 
                 info!("Reloading TLS hosts settings");
 
-                let tls_hosts_settings: settings::TlsHostsSettings = toml::from_str(
-                    &std::fs::read_to_string(&tls_hosts_settings_path)
-                        .expect("Couldn't read the TLS hosts settings file"),
-                )
-                .expect("Couldn't parse the TLS hosts settings file");
+                // Survivable for the same reason the credentials reload above
+                // is: SIGHUP used to arrive when an operator sent it, and dying
+                // on a bad file was reasonable then. It now also arrives on a
+                // timer, where an unreadable or half-written file must leave the
+                // endpoint serving what it already has rather than take every
+                // live connection down with it.
+                let reloaded = std::fs::read_to_string(&tls_hosts_settings_path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|contents| {
+                        toml::from_str::<settings::TlsHostsSettings>(&contents)
+                            .map_err(|e| e.to_string())
+                    })
+                    .and_then(|settings| {
+                        core.reload_tls_hosts_settings(settings)
+                            .map_err(|e| e.to_string())
+                    });
 
-                core.reload_tls_hosts_settings(tls_hosts_settings)
-                    .expect("Couldn't apply new settings");
-                info!("TLS hosts settings are successfully reloaded");
+                match reloaded {
+                    Ok(_) => info!("TLS hosts settings are successfully reloaded"),
+                    Err(e) => error!("Couldn't reload TLS hosts settings, keeping the current ones: {e}"),
+                }
             }
         }
     };
