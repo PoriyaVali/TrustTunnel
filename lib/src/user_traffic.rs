@@ -142,6 +142,44 @@ impl UserTraffic {
     }
 }
 
+/// Render drained usage as a JSON object keyed by username.
+///
+/// Written by hand rather than through a serializer because the crate does not
+/// depend on one, and adding a dependency to emit two integers per user is a
+/// poor trade. The escaping is the part that has to be right: a username is
+/// operator-supplied text, so it cannot be pasted between quotes and hoped for.
+pub fn render_json(usage: &[(Arc<str>, Usage)]) -> String {
+    let mut out = String::from("{");
+    for (i, (user, bytes)) in usage.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        escape_json_into(user, &mut out);
+        out.push_str(&format!(
+            "\":{{\"uplink\":{},\"downlink\":{}}}",
+            bytes.uplink, bytes.downlink
+        ));
+    }
+    out.push('}');
+    out
+}
+
+fn escape_json_into(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // Everything else below a space has no shorthand and is illegal raw.
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +193,45 @@ mod tests {
             .iter()
             .find(|(u, _)| &**u == name)
             .map(|(_, usage)| *usage)
+    }
+
+    #[test]
+    fn renders_usage_as_json() {
+        let rendered = render_json(&[(
+            user("alice"),
+            Usage {
+                uplink: 10,
+                downlink: 20,
+            },
+        )]);
+        assert_eq!(rendered, r#"{"alice":{"uplink":10,"downlink":20}}"#);
+    }
+
+    #[test]
+    fn renders_nothing_as_an_empty_object() {
+        // A quiet minute is normal and must not read as a broken response.
+        assert_eq!(render_json(&[]), "{}");
+    }
+
+    #[test]
+    fn a_username_cannot_break_out_of_the_json() {
+        // Usernames come from an operator, so they are untrusted text as far as
+        // this formatter is concerned: one containing a quote must not be able
+        // to forge extra fields.
+        let rendered = render_json(&[(
+            user(r#"ev"il\x"#),
+            Usage {
+                uplink: 1,
+                downlink: 2,
+            },
+        )]);
+        assert_eq!(rendered, r#"{"ev\"il\\x":{"uplink":1,"downlink":2}}"#);
+    }
+
+    #[test]
+    fn control_characters_are_escaped() {
+        let rendered = render_json(&[(user("a\nb\u{1}"), Usage::default())]);
+        assert!(rendered.contains(r"a\nb"), "got {rendered}");
     }
 
     #[test]

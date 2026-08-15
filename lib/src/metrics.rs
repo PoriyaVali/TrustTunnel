@@ -1,7 +1,7 @@
 use crate::http1_codec::Http1Codec;
 use crate::http_codec::HttpCodec;
 use crate::tls_demultiplexer::Protocol;
-use crate::user_traffic::UserTraffic;
+use crate::user_traffic::{self, UserTraffic};
 use crate::{core, http_codec, log_id, log_utils};
 use bytes::Bytes;
 use prometheus::Encoder;
@@ -13,6 +13,7 @@ use tokio::net::{TcpListener, TcpStream};
 const LOG_FMT: &str = "METRICS={}";
 const HEALTH_CHECK_PATH: &str = "/health-check";
 const METRICS_PATH: &str = "/metrics";
+const USER_TRAFFIC_PATH: &str = "/user-traffic";
 
 pub(crate) struct Metrics {
     _registry: prometheus::Registry,
@@ -261,6 +262,7 @@ async fn handle_request(
         let result = match path {
             HEALTH_CHECK_PATH => handle_health_check(stream),
             METRICS_PATH => handle_metrics_collect(&context.metrics, stream).await,
+            USER_TRAFFIC_PATH => handle_user_traffic(&context, stream).await,
             x => {
                 log_id!(debug, log_id, "Unexpected path: {}", x);
                 let respond = stream.split().1;
@@ -301,6 +303,67 @@ async fn handle_metrics_collect(
         .version(stream.request().request().version)
         .status(http::status::StatusCode::OK)
         .header(http::header::CONTENT_TYPE, content_type)
+        .header(http::header::CONTENT_LENGTH, content.len())
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0;
+
+    let mut sink = stream
+        .split()
+        .1
+        .send_response(response, false)?
+        .into_pipe_sink();
+
+    while !content.is_empty() {
+        content = sink.write(content)?;
+        sink.wait_writable().await?;
+    }
+
+    sink.eof()
+}
+
+/// Per-account traffic, taken and reset in one step.
+///
+/// Served only when the metrics listener is bound to a loopback address. This
+/// response names accounts, which the aggregate counters on `/metrics` do not,
+/// and the listener has no authentication of its own - so a public bind that is
+/// merely noisy today would publish the user list. A collector runs beside the
+/// endpoint, so requiring loopback costs a correct deployment nothing.
+///
+/// `?reset=0` reads without clearing, for looking by hand without stealing the
+/// bytes a collector is about to ask for.
+async fn handle_user_traffic(
+    context: &core::Context,
+    stream: Box<dyn http_codec::Stream>,
+) -> io::Result<()> {
+    let loopback_only = context
+        .settings
+        .metrics
+        .as_ref()
+        .is_some_and(|settings| settings.address.ip().is_loopback());
+
+    if !loopback_only {
+        let respond = stream.split().1;
+        respond.send_bad_response(http::status::StatusCode::FORBIDDEN, vec![])?;
+        return Ok(());
+    }
+
+    let reset = !matches!(
+        stream.request().request().uri.query(),
+        Some(query) if query.contains("reset=0")
+    );
+    let usage = if reset {
+        context.metrics.user_traffic().drain()
+    } else {
+        context.metrics.user_traffic().snapshot()
+    };
+
+    let mut content = Bytes::from(user_traffic::render_json(&usage));
+    let response = http::Response::builder()
+        .version(stream.request().request().version)
+        .status(http::status::StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/json")
         .header(http::header::CONTENT_LENGTH, content.len())
         .body(())
         .unwrap()
