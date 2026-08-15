@@ -134,9 +134,32 @@ impl Tunnel {
             let update_metrics = {
                 let metrics = context.metrics.clone();
                 let protocol = self.downstream.protocol();
+                // Resolved once per request rather than per chunk: from here on
+                // accounting is an atomic add. `None` when the credentials name
+                // no account we know, and for connections whose authentication
+                // happens per request further downstream - those are not
+                // attributed yet.
+                let user_counter = match (&authentication_policy, context.authenticator.as_ref()) {
+                    (AuthenticationPolicy::Authenticated(source), Some(authenticator)) => {
+                        authenticator
+                            .username_for(source)
+                            .map(|user| metrics.user_traffic().counter_for(&user))
+                    }
+                    _ => None,
+                };
                 move |direction, n| match direction {
-                    pipe::SimplexDirection::Incoming => metrics.add_inbound_bytes(protocol, n),
-                    pipe::SimplexDirection::Outgoing => metrics.add_outbound_bytes(protocol, n),
+                    pipe::SimplexDirection::Incoming => {
+                        metrics.add_inbound_bytes(protocol, n);
+                        if let Some(counter) = &user_counter {
+                            counter.add_uplink(n as u64);
+                        }
+                    }
+                    pipe::SimplexDirection::Outgoing => {
+                        metrics.add_outbound_bytes(protocol, n);
+                        if let Some(counter) = &user_counter {
+                            counter.add_downlink(n as u64);
+                        }
+                    }
                 }
             };
 

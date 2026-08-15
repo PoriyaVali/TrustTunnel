@@ -36,6 +36,16 @@ pub enum Status {
 pub trait Authenticator: Send + Sync {
     /// Authenticate client
     fn authenticate(&self, source: &Source<'_>, log_id: &log_utils::IdChain<u64>) -> Status;
+
+    /// The account these credentials belong to, if this implementation can say.
+    ///
+    /// Traffic can only be attributed to a user once something can turn the
+    /// credentials a connection carries into a name, and the authenticator is
+    /// the only thing holding that mapping. Defaults to `None` so an
+    /// implementation that does not track names is unaffected.
+    fn username_for(&self, _source: &Source<'_>) -> Option<std::sync::Arc<str>> {
+        None
+    }
 }
 
 impl Source<'_> {

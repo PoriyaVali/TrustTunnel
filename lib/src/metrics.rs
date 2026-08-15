@@ -1,6 +1,7 @@
 use crate::http1_codec::Http1Codec;
 use crate::http_codec::HttpCodec;
 use crate::tls_demultiplexer::Protocol;
+use crate::user_traffic::UserTraffic;
 use crate::{core, http_codec, log_id, log_utils};
 use bytes::Bytes;
 use prometheus::Encoder;
@@ -20,6 +21,11 @@ pub(crate) struct Metrics {
     outbound_traffic: prometheus::IntCounterVec,
     outbound_tcp_sockets: prometheus::IntGauge,
     outbound_udp_sockets: prometheus::IntGauge,
+    /// Per-account totals, kept beside the Prometheus registry rather than in
+    /// it: these are read and reset by whoever is billing for them, which is
+    /// not something a Prometheus counter can express. See
+    /// [`crate::user_traffic`].
+    user_traffic: UserTraffic,
 }
 
 pub(crate) struct ClientSessionsCounter {
@@ -72,8 +78,13 @@ impl Metrics {
                 registry,
             )
             .map_err(prometheus_to_io_error)?,
+            user_traffic: UserTraffic::new(),
             _registry: registry,
         }))
+    }
+
+    pub fn user_traffic(&self) -> &UserTraffic {
+        &self.user_traffic
     }
 
     pub fn client_sessions_counter(self: Arc<Self>, protocol: Protocol) -> ClientSessionsCounter {

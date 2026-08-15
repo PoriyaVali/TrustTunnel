@@ -60,16 +60,6 @@ impl ReloadableAuthenticator {
         self.len() == 0
     }
 
-    /// The username the given credentials belong to, if they are known.
-    ///
-    /// Traffic has to be attributed to a user before it can be billed, and the
-    /// credentials are the only thing a connection carries: nothing downstream
-    /// of authentication knows which account it is serving. Returning the name
-    /// here keeps that lookup in the one place that already holds the mapping.
-    pub fn username_for(&self, source: &authentication::Source<'_>) -> Option<Arc<str>> {
-        self.read().get(Self::credentials(source)).cloned()
-    }
-
     /// The credential encoding is shared with `RegistryBasedAuthenticator`, and
     /// has to stay that way: it is what arrives in a `Proxy-Authorization`
     /// header.
@@ -118,6 +108,13 @@ impl Authenticator for ReloadableAuthenticator {
         } else {
             authentication::Status::Reject
         }
+    }
+
+    /// Lives on the trait rather than as an inherent method because the core
+    /// only ever holds an `Arc<dyn Authenticator>` - an inherent method would
+    /// be unreachable from the one place that needs it.
+    fn username_for(&self, source: &authentication::Source<'_>) -> Option<Arc<str>> {
+        self.read().get(Self::credentials(source)).cloned()
     }
 }
 
