@@ -7,7 +7,8 @@ use crate::downstream::{
 use crate::forwarder::Forwarder;
 use crate::pipe::DuplexPipe;
 use crate::{
-    authentication, core, datagram_pipe, downstream, forwarder, log_id, log_utils, pipe, udp_pipe,
+    authentication, core, datagram_pipe, downstream, forwarder, log_id, log_utils, pipe,
+    udp_pipe, user_traffic,
 };
 use std::fmt::{Display, Formatter};
 use std::io;
@@ -131,33 +132,45 @@ impl Tunnel {
             let tls_domain = self.downstream.tls_domain().to_string();
             let authentication_policy = self.authentication_policy.clone();
             let log_id = self.id.clone();
+            // Which account to bill this request to. It cannot always be known
+            // before the pipe starts: a connection carrying its credentials in
+            // SNI is identified here, but one authenticating per request - which
+            // is what the reference client does - is only identified inside the
+            // spawned task below. A `OnceLock` lets both fill the same slot, and
+            // keeps the hot path an atomic load rather than a lock.
+            let user_counter: Arc<std::sync::OnceLock<Option<Arc<user_traffic::UserCounter>>>> =
+                Arc::new(std::sync::OnceLock::new());
+
+            if let (AuthenticationPolicy::Authenticated(source), Some(authenticator)) =
+                (&authentication_policy, context.authenticator.as_ref())
+            {
+                let _ = user_counter.set(
+                    authenticator
+                        .username_for(source)
+                        .map(|user| context.metrics.user_traffic().counter_for(&user)),
+                );
+            }
+
             let update_metrics = {
                 let metrics = context.metrics.clone();
                 let protocol = self.downstream.protocol();
-                // Resolved once per request rather than per chunk: from here on
-                // accounting is an atomic add. `None` when the credentials name
-                // no account we know, and for connections whose authentication
-                // happens per request further downstream - those are not
-                // attributed yet.
-                let user_counter = match (&authentication_policy, context.authenticator.as_ref()) {
-                    (AuthenticationPolicy::Authenticated(source), Some(authenticator)) => {
-                        authenticator
-                            .username_for(source)
-                            .map(|user| metrics.user_traffic().counter_for(&user))
-                    }
-                    _ => None,
-                };
-                move |direction, n| match direction {
-                    pipe::SimplexDirection::Incoming => {
-                        metrics.add_inbound_bytes(protocol, n);
-                        if let Some(counter) = &user_counter {
-                            counter.add_uplink(n as u64);
+                let user_counter = user_counter.clone();
+                move |direction, n| {
+                    // `None` until the account is known, and for credentials
+                    // naming no account we have.
+                    let counter = user_counter.get().and_then(Option::as_ref);
+                    match direction {
+                        pipe::SimplexDirection::Incoming => {
+                            metrics.add_inbound_bytes(protocol, n);
+                            if let Some(counter) = counter {
+                                counter.add_uplink(n as u64);
+                            }
                         }
-                    }
-                    pipe::SimplexDirection::Outgoing => {
-                        metrics.add_outbound_bytes(protocol, n);
-                        if let Some(counter) = &user_counter {
-                            counter.add_downlink(n as u64);
+                        pipe::SimplexDirection::Outgoing => {
+                            metrics.add_outbound_bytes(protocol, n);
+                            if let Some(counter) = counter {
+                                counter.add_downlink(n as u64);
+                            }
                         }
                     }
                 }
@@ -209,6 +222,7 @@ impl Tunnel {
                 }
             }
 
+            let user_counter = user_counter.clone();
             tokio::spawn(async move {
                 fn report_fatal_if_too_many_open_files(
                     context: &Arc<core::Context>,
@@ -263,6 +277,23 @@ impl Tunnel {
                         return;
                     }
                 };
+
+                // The account is known now even when SNI did not carry it, so
+                // fill the slot the metrics closure reads. Already set for an
+                // SNI-authenticated connection, and `set` on a filled `OnceLock`
+                // is a no-op, so this is the only place the other mode gets
+                // counted at all.
+                if user_counter.get().is_none() {
+                    if let (Some(source), Some(authenticator)) =
+                        (forwarder_auth.as_ref(), context.authenticator.as_ref())
+                    {
+                        let _ = user_counter.set(
+                            authenticator
+                                .username_for(source)
+                                .map(|user| context.metrics.user_traffic().counter_for(&user)),
+                        );
+                    }
+                }
 
                 log_id!(
                     trace,
