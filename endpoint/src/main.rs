@@ -5,7 +5,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::signal;
 use toml_edit::{Document, Item, Table};
-use trusttunnel::authentication::registry_based::RegistryBasedAuthenticator;
+use trusttunnel::authentication::reloadable::ReloadableAuthenticator;
 use trusttunnel::authentication::Authenticator;
 use trusttunnel::client_config;
 use trusttunnel::client_random_prefix::{self, GeneratorParams};
@@ -496,11 +496,16 @@ fn main() {
     };
 
     let shutdown = Shutdown::new();
+    // Held by concrete type as well as behind `dyn`, so SIGHUP can still reach
+    // `reload()` after the core has taken its copy.
+    let reloadable_authenticator = Arc::new(ReloadableAuthenticator::new(settings.get_clients()));
     let authenticator: Option<Arc<dyn Authenticator>> = if !settings.get_clients().is_empty() {
-        Some(Arc::new(RegistryBasedAuthenticator::new(
-            settings.get_clients(),
-        )))
+        Some(reloadable_authenticator.clone())
     } else {
+        // Unchanged from before: with no credentials file the endpoint does not
+        // authenticate at all, which is why the warning above exists. Note that
+        // it also means an endpoint started without one cannot be given users
+        // by a reload - the file has to exist before it starts.
         None
     };
     let core = Arc::new(
@@ -518,14 +523,42 @@ fn main() {
         async move { core.listen().await }
     };
 
+    let credentials_path = extract_settings_file_path(&settings_contents, settings_path, "credentials_file");
+    if credentials_path.is_none() {
+        debug!("No credentials_file configured; SIGHUP will not reload clients");
+    }
+
     let reload_tls_hosts_task = {
         let tls_hosts_settings_path = tls_hosts_settings_path.clone();
+        let credentials_path = credentials_path.clone();
+        let reloadable_authenticator = reloadable_authenticator.clone();
         async move {
             let mut sighup_listener = signal::unix::signal(signal::unix::SignalKind::hangup())
                 .expect("Couldn't start SIGHUP listener");
 
             loop {
                 sighup_listener.recv().await;
+
+                // Clients first, and never fatally: this is the half a panel
+                // drives on a timer, so a file caught mid-write has to leave the
+                // endpoint serving the list it already has rather than take it
+                // down. The TLS reload below keeps its original behaviour.
+                if let Some(path) = credentials_path.as_ref() {
+                    match std::fs::read_to_string(path)
+                        .map_err(|e| e.to_string())
+                        .and_then(|content| settings::parse_clients_toml(&content))
+                    {
+                        Ok(clients) => {
+                            let count = reloadable_authenticator.reload(&clients);
+                            info!("Reloaded {count} clients");
+                        }
+                        Err(e) => error!(
+                            "Couldn't reload credentials, keeping the previous {} clients: {e}",
+                            reloadable_authenticator.len()
+                        ),
+                    }
+                }
+
                 info!("Reloading TLS hosts settings");
 
                 let tls_hosts_settings: settings::TlsHostsSettings = toml::from_str(
@@ -626,9 +659,22 @@ fn append_allow_rule(rules_path: &Path, client_random_prefix: &str) -> std::io::
 }
 
 fn extract_rules_file_path(settings_contents: &str, settings_path: &str) -> Option<PathBuf> {
+    extract_settings_file_path(settings_contents, settings_path, "rules_file")
+}
+
+/// Resolve a path named by a settings key, relative to the settings file.
+///
+/// The deserializer consumes `credentials_file` and `rules_file` into their
+/// parsed forms and keeps no path, so anything that needs to re-read one of
+/// those files later has to recover the path from the raw settings text.
+fn extract_settings_file_path(
+    settings_contents: &str,
+    settings_path: &str,
+    key: &str,
+) -> Option<PathBuf> {
     let value = settings_contents.parse::<toml::Value>().ok()?;
-    let rules_file = value.get("rules_file")?.as_str()?;
-    let path = Path::new(rules_file);
+    let file = value.get(key)?.as_str()?;
+    let path = Path::new(file);
 
     if path.is_absolute() {
         return Some(path.to_path_buf());
