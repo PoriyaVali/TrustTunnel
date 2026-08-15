@@ -51,10 +51,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Matches our own Debian servers, and is the target we would deploy
-          # first.
+          # Links against the runner's glibc, so it only runs on a box at
+          # least as new as the runner. Kept for a quick native smoke test.
           - target: x86_64-unknown-linux-gnu
-          # Static, so it runs on any node regardless of glibc version.
+          # Static, and therefore the one we actually deploy: our servers run
+          # Debian 11 (glibc 2.31) while the runner is far newer.
           - target: x86_64-unknown-linux-musl
           # For arm64 nodes.
           - target: aarch64-unknown-linux-musl
@@ -70,20 +71,27 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential cmake libclang-dev
 
-      # The workspace compiles C (lib/src/net_utils.c) through the cc crate, so
-      # a cross-build needs a C cross-compiler as well as the Rust target.
-      - name: musl cross toolchain
+      # A musl build needs a cross *C++* compiler, not just a C one: boring-sys
+      # builds BoringSSL through CMake, which stops at CMAKE_CXX_COMPILER.
+      # Ubuntu's musl-tools ships musl-gcc with no musl-g++, which is why the
+      # obvious apt package is not enough. Upstream solves this with a full
+      # cross toolchain baked into their own container image; zig carries both
+      # halves for every musl target in one download, which is the equivalent
+      # on a stock runner.
+      - name: Install zig
         if: contains(matrix.target, 'musl')
-        run: |
-          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
-            sudo apt-get install -y musl-tools musl-dev
-            echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
-            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> "$GITHUB_ENV"
-          else
-            sudo apt-get install -y gcc-aarch64-linux-gnu
-            echo "CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-          fi
+        run: pip3 install ziglang
+
+      - name: Install cargo-zigbuild
+        if: contains(matrix.target, 'musl')
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      # Only needed to strip the arm64 binary; the compiler itself comes from zig.
+      - name: arm64 binutils
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: sudo apt-get install -y binutils-aarch64-linux-gnu
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -92,8 +100,13 @@ jobs:
       # Same two binaries the Makefile and upstream's Dockerfile produce.
       - name: Build
         run: |
-          cargo build --release --target ${{ matrix.target }} \
-            --bin trusttunnel_endpoint --bin setup_wizard
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            cargo build --release --target ${{ matrix.target }} \
+              --bin trusttunnel_endpoint --bin setup_wizard
+          else
+            cargo zigbuild --release --target ${{ matrix.target }} \
+              --bin trusttunnel_endpoint --bin setup_wizard
+          fi
 
       # The workspace sets `debug = true` on the release profile, so the linked
       # binaries carry full symbols. Keep both: the stripped one to deploy, the
@@ -105,9 +118,9 @@ jobs:
           for b in trusttunnel_endpoint setup_wizard; do
             cp "$b" "$b.debug"
             if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-              aarch64-linux-gnu-strip "$b" || true
+              aarch64-linux-gnu-strip "$b"
             else
-              strip "$b" || true
+              strip "$b"
             fi
           done
           echo "after:"; ls -lh trusttunnel_endpoint setup_wizard | awk '{print $5, $9}'
@@ -116,9 +129,15 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           file trusttunnel_endpoint
-          # Only a native binary can be executed on the runner.
+          # The whole point of the musl targets is that they carry no libc
+          # dependency, so assert it rather than trusting the target name.
+          if [ "${{ matrix.target }}" != "x86_64-unknown-linux-gnu" ]; then
+            file trusttunnel_endpoint | grep -q "statically linked" \
+              || { echo "musl build is not static"; exit 1; }
+          fi
+          # Only an x86_64 binary can be executed on the runner.
           if [ "${{ matrix.target }}" != "aarch64-unknown-linux-musl" ]; then
-            ./trusttunnel_endpoint --help || ./trusttunnel_endpoint --version || true
+            ./trusttunnel_endpoint --help
           fi
 
       - uses: actions/upload-artifact@v4
