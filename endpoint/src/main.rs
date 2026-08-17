@@ -534,8 +534,13 @@ fn main() {
     // the client list and signals immediately after spawning - which is exactly
     // what a panel-driven deployment does - would otherwise kill the endpoint it
     // just started, every time.
-    let mut sighup_listener = signal::unix::signal(signal::unix::SignalKind::hangup())
-        .expect("Couldn't start SIGHUP listener");
+    // Registering needs a runtime context but must not wait for the runtime to
+    // start polling: `rt.enter()` gives the first without the second.
+    let mut sighup_listener = {
+        let _guard = rt.enter();
+        signal::unix::signal(signal::unix::SignalKind::hangup())
+            .expect("Couldn't start SIGHUP listener")
+    };
 
     let reload_tls_hosts_task = {
         let tls_hosts_settings_path = tls_hosts_settings_path.clone();
