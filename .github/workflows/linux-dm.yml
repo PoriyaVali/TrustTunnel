@@ -149,12 +149,17 @@ jobs:
           set -eu
           cd target/${{ matrix.target }}/release
           work="$(mktemp -d)"
+          # Generate and run from the same directory, exactly as V2bX does
+          # (cmd.Dir = dir, relative --lib-settings). The wizard writes
+          # credentials_file relative to where it ran, so splitting the two
+          # leaves a path the endpoint cannot resolve - which is what this
+          # test got wrong on its first run.
+          cp ./trusttunnel_endpoint ./setup_wizard "$work/"
+          cd "$work"
           ./setup_wizard -m non-interactive \
             -n ci.local -a 127.0.0.1:18443 -c "ci:ci" \
-            --lib-settings "$work/vpn.toml" --hosts-settings "$work/hosts.toml" \
+            --lib-settings ./vpn.toml --hosts-settings ./hosts.toml \
             --cert-type self-signed >/dev/null
-          cp ./trusttunnel_endpoint "$work/"
-          cd "$work"
 
           ./trusttunnel_endpoint ./vpn.toml ./hosts.toml -l info > out.log 2>&1 &
           pid=$!
