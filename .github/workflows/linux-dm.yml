@@ -140,6 +140,51 @@ jobs:
             ./trusttunnel_endpoint --help
           fi
 
+      # Actually run it. `--help` proves the binary loads; it does not prove the
+      # endpoint reaches a listening state, and it says nothing about signals.
+      # Two releases shipped startup bugs that every other check here passed.
+      - name: Starts, listens, and survives SIGHUP
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        run: |
+          set -eu
+          cd target/${{ matrix.target }}/release
+          work="$(mktemp -d)"
+          ./setup_wizard -m non-interactive \
+            -n ci.local -a 127.0.0.1:18443 -c "ci:ci" \
+            --lib-settings "$work/vpn.toml" --hosts-settings "$work/hosts.toml" \
+            --cert-type self-signed >/dev/null
+          cp ./trusttunnel_endpoint "$work/"
+          cd "$work"
+
+          ./trusttunnel_endpoint ./vpn.toml ./hosts.toml -l info > out.log 2>&1 &
+          pid=$!
+
+          # Wait for it to listen rather than sleeping a fixed time.
+          for _ in $(seq 1 60); do
+            grep -q "Listening to TCP" out.log && break
+            kill -0 "$pid" 2>/dev/null || { echo "endpoint exited during startup:"; cat out.log; exit 1; }
+            sleep 0.5
+          done
+          grep -q "Listening to TCP" out.log || { echo "never listened:"; cat out.log; exit 1; }
+
+          # The signal a panel sends as soon as a node appears. It must reload,
+          # not terminate - and the process id must not change.
+          kill -HUP "$pid"
+          sleep 3
+          kill -0 "$pid" 2>/dev/null || { echo "SIGHUP killed the endpoint:"; cat out.log; exit 1; }
+
+          # And it must survive one sent immediately after a start, which is
+          # what actually happens in production.
+          kill -TERM "$pid"; wait "$pid" 2>/dev/null || true
+          ./trusttunnel_endpoint ./vpn.toml ./hosts.toml -l info > out2.log 2>&1 &
+          pid=$!
+          kill -HUP "$pid" 2>/dev/null || true
+          sleep 3
+          kill -0 "$pid" 2>/dev/null || { echo "an early SIGHUP killed it:"; cat out2.log; exit 1; }
+          kill -TERM "$pid" 2>/dev/null || true
+
+          echo "startup, listen, reload and early-reload all survived"
+
       - uses: actions/upload-artifact@v4
         with:
           name: trusttunnel-${{ matrix.target }}
