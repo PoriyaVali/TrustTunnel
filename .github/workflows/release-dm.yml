@@ -1,0 +1,94 @@
+name: release-dm
+
+# Publish the endpoint binaries so a V2bX node can install them.
+#
+# Upstream's release workflow needs AdGuard's private runners, so this is the
+# fork's own. Asset names follow the arch strings V2bX's installer already uses
+# (`linux-64`, `linux-arm64-v8a`), because that installer is the only consumer:
+# a name that does not match is a download that 404s on the operator's box.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            asset: linux-64
+          - target: aarch64-unknown-linux-musl
+            asset: linux-arm64-v8a
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install 1.95 --profile minimal --target ${{ matrix.target }}
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libclang-dev
+
+      # BoringSSL needs a cross C++ compiler and Ubuntu's musl-tools has no
+      # musl-g++; zig carries both halves. Same reason as linux-dm.yml.
+      - name: Install zig
+        run: pip3 install ziglang
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: arm64 binutils
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: sudo apt-get install -y binutils-aarch64-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        run: |
+          cargo zigbuild --release --target ${{ matrix.target }} \
+            --bin trusttunnel_endpoint --bin setup_wizard
+
+      # The release profile keeps debug symbols, which is 250 MB per binary of
+      # something nobody downloading a node needs.
+      - name: Strip
+        run: |
+          cd target/${{ matrix.target }}/release
+          for b in trusttunnel_endpoint setup_wizard; do
+            if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+              aarch64-linux-gnu-strip "$b"
+            else
+              strip "$b"
+            fi
+          done
+          ls -lh trusttunnel_endpoint setup_wizard | awk '{print $5, $9}'
+
+      - name: Check it is static
+        run: |
+          cd target/${{ matrix.target }}/release
+          file trusttunnel_endpoint | grep -q "statically linked" \
+            || { echo "not static - it would not run on an older node"; exit 1; }
+
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          zip -j /tmp/TrustTunnel-${{ matrix.asset }}.zip trusttunnel_endpoint setup_wizard
+          ls -lh /tmp/TrustTunnel-${{ matrix.asset }}.zip
+
+      - name: Upload to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: /tmp/TrustTunnel-${{ matrix.asset }}.zip
+          fail_on_unmatched_files: true
