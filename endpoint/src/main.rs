@@ -528,14 +528,20 @@ fn main() {
         debug!("No credentials_file configured; SIGHUP will not reload clients");
     }
 
+    // Registered here rather than inside the task below, because a future does
+    // nothing until it is first polled: until then SIGHUP keeps its default
+    // disposition, which is to terminate the process. A supervisor that writes
+    // the client list and signals immediately after spawning - which is exactly
+    // what a panel-driven deployment does - would otherwise kill the endpoint it
+    // just started, every time.
+    let mut sighup_listener = signal::unix::signal(signal::unix::SignalKind::hangup())
+        .expect("Couldn't start SIGHUP listener");
+
     let reload_tls_hosts_task = {
         let tls_hosts_settings_path = tls_hosts_settings_path.clone();
         let credentials_path = credentials_path.clone();
         let reloadable_authenticator = reloadable_authenticator.clone();
         async move {
-            let mut sighup_listener = signal::unix::signal(signal::unix::SignalKind::hangup())
-                .expect("Couldn't start SIGHUP listener");
-
             loop {
                 sighup_listener.recv().await;
 
