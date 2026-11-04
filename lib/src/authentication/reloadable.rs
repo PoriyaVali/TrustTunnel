@@ -116,6 +116,12 @@ impl Authenticator for ReloadableAuthenticator {
     fn username_for(&self, source: &authentication::Source<'_>) -> Option<Arc<str>> {
         self.read().get(Self::credentials(source)).cloned()
     }
+
+    /// Upstream's per-client metrics ask through this one. The endpoint runs
+    /// this authenticator, so without it they would label nobody.
+    fn username(&self, source: &authentication::Source<'_>) -> Option<String> {
+        self.username_for(source).map(|name| name.to_string())
+    }
 }
 
 #[cfg(test)]
