@@ -505,6 +505,25 @@ fn handle_health_check(stream: Box<dyn http_codec::Stream>) -> io::Result<()> {
     stream.split().1.send_ok_response(true).map(|_| ())
 }
 
+/// Who `/clients` lists. The endpoint reloads its clients on SIGHUP, which
+/// changes the authenticator but not the settings it started with, so the
+/// authenticator is asked first: otherwise removed users would stay listed and
+/// added ones would appear only while connected.
+fn configured_usernames(context: &core::Context) -> Vec<String> {
+    context
+        .authenticator
+        .as_ref()
+        .and_then(|authenticator| authenticator.usernames())
+        .unwrap_or_else(|| {
+            context
+                .settings
+                .clients
+                .iter()
+                .map(|c| c.username.clone())
+                .collect()
+        })
+}
+
 async fn handle_clients_collect(
     context: Arc<core::Context>,
     metrics: &Metrics,
@@ -515,12 +534,7 @@ async fn handle_clients_collect(
         return respond.send_bad_response(http::status::StatusCode::NOT_FOUND, vec![]);
     }
 
-    let configured_usernames: Vec<String> = context
-        .settings
-        .clients
-        .iter()
-        .map(|c| c.username.clone())
-        .collect();
+    let configured_usernames = configured_usernames(&context);
     let content_vec = match serde_json::to_vec(&metrics.clients_summary(&configured_usernames)) {
         Ok(v) => v,
         Err(_) => {
@@ -654,6 +668,35 @@ fn prometheus_to_io_error(e: prometheus::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clients_follow_a_reload_of_the_authenticator() {
+        use crate::authentication::registry_based::Client;
+        use crate::authentication::reloadable::ReloadableAuthenticator;
+        use crate::authentication::Authenticator;
+
+        let client = |name: &str| Client {
+            username: name.to_string(),
+            password: format!("{name}-pw"),
+            max_http2_conns: None,
+            max_http3_conns: None,
+        };
+        let auth = Arc::new(ReloadableAuthenticator::new(&[
+            client("alice"),
+            client("bob"),
+        ]));
+        let mut context = core::Context::default();
+        context.authenticator = Some(auth.clone() as Arc<dyn Authenticator>);
+        assert_eq!(configured_usernames(&context), ["alice", "bob"]);
+
+        // What SIGHUP does to the clients: the list must follow, not stay
+        // the one the endpoint started with.
+        auth.reload(&[client("bob"), client("carol")]);
+        assert_eq!(configured_usernames(&context), ["bob", "carol"]);
+
+        // Without an authenticator that can say, the startup settings answer.
+        assert!(configured_usernames(&core::Context::default()).is_empty());
+    }
 
     fn metrics(per_client: bool) -> Arc<Metrics> {
         Metrics::new(per_client).unwrap()

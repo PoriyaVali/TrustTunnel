@@ -52,6 +52,14 @@ pub trait Authenticator: Send + Sync {
     fn username(&self, _source: &Source<'_>) -> Option<String> {
         None
     }
+
+    /// The usernames of the clients accepted right now, if this implementation
+    /// can say. Per-client metrics list them, and an authenticator whose clients
+    /// are reloaded at runtime knows them better than the settings the endpoint
+    /// started with. `None` by default.
+    fn usernames(&self) -> Option<Vec<String>> {
+        None
+    }
 }
 
 impl Source<'_> {
