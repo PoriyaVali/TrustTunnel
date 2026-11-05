@@ -12,6 +12,11 @@ name: release-dm
 # to try a build on one node first; a pre-release is never "latest". The
 # release is created only after both architectures built and passed their
 # checks, so a node never finds a release missing its asset.
+#
+# Once the pre-release has been tried, run it again with the same tag and
+# `promote`. That builds nothing: it checks the assets against their
+# SHA256SUMS.txt and marks that same release the latest full release, so the
+# nodes get the bytes that were tried, not a rebuild of them.
 
 on:
   workflow_dispatch:
@@ -23,6 +28,10 @@ on:
         description: 'Pre-release: not installed by v2bx update until a full release follows'
         type: boolean
         default: true
+      promote:
+        description: 'Promote: no build; make the existing pre-release for this tag the latest full release'
+        type: boolean
+        default: false
   push:
     tags:
       - 'v*'
@@ -50,6 +59,7 @@ jobs:
 
   build:
     needs: version
+    if: ${{ !inputs.promote }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -151,6 +161,7 @@ jobs:
 
   release:
     needs: [version, build]
+    if: ${{ !inputs.promote }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -172,3 +183,31 @@ jobs:
           prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease }}
           files: dist/*
           fail_on_unmatched_files: true
+
+  promote:
+    needs: version
+    if: ${{ inputs.promote }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - name: Check the pre-release
+        run: |
+          set -eu
+          info="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,assets)"
+          [ "$(jq -r .isDraft <<<"$info")" = false ] \
+            || { echo "::error::$TAG is a draft"; exit 1; }
+          [ "$(jq -r .isPrerelease <<<"$info")" = true ] \
+            || { echo "::error::$TAG is not a pre-release, so there is nothing to promote"; exit 1; }
+          for a in TrustTunnel-linux-64.zip TrustTunnel-linux-arm64-v8a.zip SHA256SUMS.txt; do
+            jq -e --arg a "$a" '.assets | any(.name == $a)' <<<"$info" >/dev/null \
+              || { echo "::error::$TAG has no $a"; exit 1; }
+          done
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist
+          cd dist
+          sha256sum -c SHA256SUMS.txt
+      - name: Make it the latest full release
+        run: |
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isPrerelease,url
