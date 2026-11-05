@@ -16,9 +16,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- `is_global_ipv6` incorrectly classified global unicast IPv6 addresses (e.g. `2001:4860:4860::8888`) as non-global.
-
 ### Security
+
+## [1.1.0] - 2026-09-01
+
+### Added
+
+- [Feature] Optional per-user metrics behind the `per_client_metrics` metrics
+  config flag (default `false`). When enabled, `/metrics` additionally exposes
+  `client_sessions_per_user`, `inbound_traffic_bytes_per_user`, and
+  `outbound_traffic_bytes_per_user` labelled with the authenticated `username`,
+  and a new `/clients` JSON endpoint reports per-user aggregates (sessions,
+  traffic, IP). Aggregate metrics are unchanged. Exposes usernames and client
+  IPs, so only enable it on a protected metrics listener.
+
+### Changed
+
+- The released version is now derived from the git tag instead of a hardcoded value; `trusttunnel_endpoint --version` reports the version of the tag it was built from.
+
+### Fixed
+
+- `allow_private_network_connections = false` no longer blocks the `[reverse_proxy]` `server_address`: the origin server address comes from the endpoint configuration, so a loopback or private address stays reachable while tunneled client traffic to private networks remains forbidden.
+- `is_global_ipv6` incorrectly classified global unicast IPv6 addresses (e.g. `2001:4860:4860::8888`) as non-global.
+- UDP timeout cleanup no longer leaks outbound sockets: the expired-connection path now passes the reverse-oriented meta to `on_connection_closed`, matching the direct forwarder's orientation contract so the kernel UDP socket and its `outbound_udp_sockets` metric are actually released after `udp_connections_timeout_secs` of inactivity.
 
 ## [1.0.41] - 2026-04-30
 
@@ -268,8 +288,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Test changelog entry please ignore
 
-[Unreleased]: https://github.com/TrustTunnel/TrustTunnel/compare/1f3ffda5...HEAD
-[1.0.41]: https://github.com/TrustTunnel/TrustTunnel/compare/32bc4a47...1f3ffda5
+[Unreleased]: https://github.com/TrustTunnel/TrustTunnel/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/TrustTunnel/TrustTunnel/compare/v1.0.41...v1.1.0
+[1.0.41]: https://github.com/TrustTunnel/TrustTunnel/compare/32bc4a47...v1.0.41
 [1.0.28]: https://github.com/TrustTunnel/TrustTunnel/compare/v1.0.17...32bc4a47
 [1.0.17]: https://github.com/TrustTunnel/TrustTunnel/compare/v1.0.16...v1.0.17
 [1.0.16]: https://github.com/TrustTunnel/TrustTunnel/compare/v1.0.13...v1.0.16

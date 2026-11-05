@@ -6,9 +6,32 @@ name: release-dm
 # fork's own. Asset names follow the arch strings V2bX's installer already uses
 # (`linux-64`, `linux-arm64-v8a`), because that installer is the only consumer:
 # a name that does not match is a download that 404s on the operator's box.
+#
+# `v2bx update` installs the latest full release, so a release here reaches
+# every node on its next update. Run it by hand with `prerelease` (the default)
+# to try a build on one node first; a pre-release is never "latest". The
+# release is created only after both architectures built and passed their
+# checks, so a node never finds a release missing its asset.
+#
+# Once the pre-release has been tried, run it again with the same tag and
+# `promote`. That builds nothing: it checks the assets against their
+# SHA256SUMS.txt and marks that same release the latest full release, so the
+# nodes get the bytes that were tried, not a rebuild of them.
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to create and release, e.g. v1.1.0-dm.1'
+        required: true
+      prerelease:
+        description: 'Pre-release: not installed by v2bx update until a full release follows'
+        type: boolean
+        default: true
+      promote:
+        description: 'Promote: no build; make the existing pre-release for this tag the latest full release'
+        type: boolean
+        default: false
   push:
     tags:
       - 'v*'
@@ -17,7 +40,26 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release tags look like v1.1.0-dm.1, not '$TAG'"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    if: ${{ !inputs.promote }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -27,42 +69,33 @@ jobs:
             asset: linux-64
           - target: aarch64-unknown-linux-musl
             asset: linux-arm64-v8a
-
+    env:
+      # endpoint/build.rs reads this; without it a checkout with no tags
+      # reports 0.0.0-git from `trusttunnel_endpoint --version`.
+      TRUSTTUNNEL_VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Rust
         run: rustup toolchain install 1.95 --profile minimal --target ${{ matrix.target }}
-
       - name: Build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake libclang-dev
-
-      # BoringSSL needs a cross C++ compiler and Ubuntu's musl-tools has no
-      # musl-g++; zig carries both halves. Same reason as linux-dm.yml.
       - name: Install zig
         run: pip3 install ziglang
-
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild
-
       - name: arm64 binutils
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: sudo apt-get install -y binutils-aarch64-linux-gnu
-
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
-
       - name: Build
         run: |
           cargo zigbuild --release --target ${{ matrix.target }} \
             --bin trusttunnel_endpoint --bin setup_wizard
-
-      # The release profile keeps debug symbols, which is 250 MB per binary of
-      # something nobody downloading a node needs.
       - name: Strip
         run: |
           cd target/${{ matrix.target }}/release
@@ -74,21 +107,107 @@ jobs:
             fi
           done
           ls -lh trusttunnel_endpoint setup_wizard | awk '{print $5, $9}'
-
       - name: Check it is static
         run: |
           cd target/${{ matrix.target }}/release
           file trusttunnel_endpoint | grep -q "statically linked" \
             || { echo "not static - it would not run on an older node"; exit 1; }
-
+      - name: Reports the release version
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          got="$(target/${{ matrix.target }}/release/trusttunnel_endpoint --version)"
+          echo "$got"
+          case "$got" in
+            *"$TRUSTTUNNEL_VERSION"*) ;;
+            *) echo "::error::--version says '$got', want $TRUSTTUNNEL_VERSION"; exit 1 ;;
+          esac
+      # The same check as linux-dm: generate and run from one directory, as
+      # V2bX does, then send the SIGHUP a panel sends as soon as a node appears.
+      - name: Starts, listens, and survives SIGHUP
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          set -eu
+          work="$(mktemp -d)"
+          cp target/${{ matrix.target }}/release/trusttunnel_endpoint \
+             target/${{ matrix.target }}/release/setup_wizard "$work/"
+          cd "$work"
+          ./setup_wizard -m non-interactive \
+            -n ci.local -a 127.0.0.1:18443 -c "ci:ci" \
+            --lib-settings ./vpn.toml --hosts-settings ./hosts.toml \
+            --cert-type self-signed >/dev/null
+          ./trusttunnel_endpoint ./vpn.toml ./hosts.toml -l info > out.log 2>&1 &
+          pid=$!
+          for _ in $(seq 1 60); do
+            grep -q "Listening to TCP" out.log && break
+            kill -0 "$pid" 2>/dev/null || { echo "endpoint exited during startup:"; cat out.log; exit 1; }
+            sleep 0.5
+          done
+          grep -q "Listening to TCP" out.log || { echo "never listened:"; cat out.log; exit 1; }
+          kill -HUP "$pid"
+          sleep 3
+          kill -0 "$pid" 2>/dev/null || { echo "SIGHUP killed the endpoint:"; cat out.log; exit 1; }
+          kill -TERM "$pid" 2>/dev/null || true
+          echo "started, listened, and survived SIGHUP"
       - name: Package
         run: |
           cd target/${{ matrix.target }}/release
-          zip -j /tmp/TrustTunnel-${{ matrix.asset }}.zip trusttunnel_endpoint setup_wizard
-          ls -lh /tmp/TrustTunnel-${{ matrix.asset }}.zip
-
-      - name: Upload to the release
-        uses: softprops/action-gh-release@v2
+          zip -j "$GITHUB_WORKSPACE/TrustTunnel-${{ matrix.asset }}.zip" trusttunnel_endpoint setup_wizard
+          ls -lh "$GITHUB_WORKSPACE/TrustTunnel-${{ matrix.asset }}.zip"
+      - uses: actions/upload-artifact@v4
         with:
-          files: /tmp/TrustTunnel-${{ matrix.asset }}.zip
+          name: TrustTunnel-${{ matrix.asset }}
+          path: TrustTunnel-${{ matrix.asset }}.zip
+          if-no-files-found: error
+
+  release:
+    needs: [version, build]
+    if: ${{ !inputs.promote }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum TrustTunnel-*.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: TrustTunnel endpoint ${{ needs.version.outputs.tag }}
+          body: |
+            Endpoint binaries for V2bX nodes, built from ${{ github.sha }}: `trusttunnel_endpoint` and `setup_wizard` for linux-64 and linux-arm64-v8a, static (musl). `trusttunnel_endpoint --version` reports ${{ needs.version.outputs.version }}.
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease }}
+          files: dist/*
           fail_on_unmatched_files: true
+
+  promote:
+    needs: version
+    if: ${{ inputs.promote }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - name: Check the pre-release
+        run: |
+          set -eu
+          info="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,assets)"
+          [ "$(jq -r .isDraft <<<"$info")" = false ] \
+            || { echo "::error::$TAG is a draft"; exit 1; }
+          [ "$(jq -r .isPrerelease <<<"$info")" = true ] \
+            || { echo "::error::$TAG is not a pre-release, so there is nothing to promote"; exit 1; }
+          for a in TrustTunnel-linux-64.zip TrustTunnel-linux-arm64-v8a.zip SHA256SUMS.txt; do
+            jq -e --arg a "$a" '.assets | any(.name == $a)' <<<"$info" >/dev/null \
+              || { echo "::error::$TAG has no $a"; exit 1; }
+          done
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist
+          cd dist
+          sha256sum -c SHA256SUMS.txt
+      - name: Make it the latest full release
+        run: |
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isPrerelease,url
